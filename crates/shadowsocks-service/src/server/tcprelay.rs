@@ -25,7 +25,7 @@ use tokio::{
 
 use crate::net::{MonProxyStream, OutboundProxyStream, TcpDialer, utils::ignore_until_end};
 
-use super::context::ServiceContext;
+use super::{context::ServiceContext, uot};
 
 /// `TcpDialer` adapter that uses the server's connect-options.
 struct ServerTcpDialer<'a> {
@@ -247,6 +247,13 @@ impl TcpServerClient {
             "accepted tcp client connection {}, establishing tunnel to {}",
             self.peer_addr, target_addr
         );
+
+        // UoT's magic domain is not a real outbound target: the rest of the stream carries UDP
+        // datagrams, whose own destinations are ACL checked inside the relay.
+        if uot::is_magic_address(&target_addr) {
+            debug!("accepted uot client connection {}", self.peer_addr);
+            return uot::serve(self.context, self.peer_addr, self.stream).await;
+        }
 
         if self.context.check_outbound_blocked(&target_addr).await {
             error!(
