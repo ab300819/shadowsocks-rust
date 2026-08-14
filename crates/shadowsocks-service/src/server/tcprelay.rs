@@ -248,11 +248,11 @@ impl TcpServerClient {
             self.peer_addr, target_addr
         );
 
-        // UoT's magic domain is not a real outbound target: the rest of the stream carries UDP
+        // UoT's magic domains are not real outbound targets: the rest of the stream carries UDP
         // datagrams, whose own destinations are ACL checked inside the relay.
-        if uot::is_magic_address(&target_addr) {
-            debug!("accepted uot client connection {}", self.peer_addr);
-            return uot::serve(self.context, self.peer_addr, self.stream).await;
+        if let Some(version) = uot::detect_magic(&target_addr) {
+            debug!("accepted uot client connection {} with {:?}", self.peer_addr, version);
+            return uot::serve(self.context, self.peer_addr, self.stream, version).await;
         }
 
         if self.context.check_outbound_blocked(&target_addr).await {

@@ -1,19 +1,23 @@
 //! Shadowsocks UoT (UDP-over-TCP) server
 //!
 //! Implements the server side of sing's UoT protocol (`github.com/sagernet/sing/common/uot`).
-//! Clients (mihomo, Shadowrocket, sing-box) request the magic domain `sp.udp-over-tcp.arpa` as the
-//! shadowsocks TCP target and then tunnel UDP datagrams inside that TCP stream, which lets UDP pass
-//! through TCP-only transports like `v2ray-plugin`'s websocket mode.
+//! Clients (mihomo, Shadowrocket, sing-box) request a magic domain as the shadowsocks TCP target
+//! and then tunnel UDP datagrams inside that TCP stream, which lets UDP pass through TCP-only
+//! transports like `v2ray-plugin`'s websocket mode.
 //!
-//! Frame layout, on the already decrypted shadowsocks stream:
+//! Frame layouts, on the already decrypted shadowsocks stream:
 //!
 //! ```text
-//! | ATYP u8 | address | port u16be | length u16be | data |
+//! v1 (sp.udp-over-tcp.arpa), v2 non-connect:  | ATYP u8 | address | port u16be | length u16be | data |
+//! v2 (sp.v2.udp-over-tcp.arpa) connect:       | length u16be | data |
 //! ```
 //!
-//! NOTE: the ATYP values are *not* the SOCKS5 ones (sing calls this codec `AddrParser`): `0x00`
-//! IPv4, `0x01` IPv6, `0x02` domain. The frame codec is ported from `cfal/shoes`
-//! `src/uot/uot_common.rs` (MIT licensed), see `reference/shoes-uot/PROVENANCE.md`.
+//! v2 additionally starts with a request header `| isConnect u8 | SOCKS5 address |`.
+//!
+//! NOTE: the ATYP values in the frames above are *not* the SOCKS5 ones (sing calls this codec
+//! `AddrParser`): `0x00` IPv4, `0x01` IPv6, `0x02` domain. Only the v2 request header carries a
+//! real SOCKS5 address. The frame codec is ported from `cfal/shoes` `src/uot/uot_common.rs`
+//! (MIT licensed), see `reference/shoes-uot/PROVENANCE.md`.
 
 use std::{
     io::{self, ErrorKind},
@@ -36,8 +40,10 @@ use crate::net::utils::to_ipv4_mapped;
 
 use super::context::ServiceContext;
 
-/// Magic domain of UoT (sing's `LegacyMagicAddress`)
-const UOT_MAGIC_ADDRESS: &str = "sp.udp-over-tcp.arpa";
+/// Magic domain of UoT v1 (sing's `LegacyMagicAddress`)
+const UOT_V1_MAGIC_ADDRESS: &str = "sp.udp-over-tcp.arpa";
+/// Magic domain of UoT v2 (sing's `MagicAddress`)
+const UOT_V2_MAGIC_ADDRESS: &str = "sp.v2.udp-over-tcp.arpa";
 
 /// Frame ATYPs (sing's `AddrParser`), which differ from the SOCKS5 ones
 const UOT_ATYP_IPV4: u8 = 0x00;
@@ -51,43 +57,96 @@ const UOT_STREAM_BUFFER_SIZE: usize = 8192;
 /// on the TCP stream instead of growing memory.
 const UOT_SEND_CHANNEL_SIZE: usize = 64;
 
-/// Check if `addr` is the UoT magic domain, which means the stream carries UDP datagrams
+/// UoT protocol version, selected by the magic domain the client requested
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UotVersion {
+    V1,
+    V2,
+}
+
+/// Check if `addr` is a UoT magic domain, which means the stream carries UDP datagrams
 /// instead of a TCP tunnel.
 ///
-/// Clients use port 0 by convention, but the domain alone is the signal.
-pub fn is_magic_address(addr: &Address) -> bool {
+/// Clients use port 0 by convention, but the version is signalled by the domain alone.
+pub fn detect_magic(addr: &Address) -> Option<UotVersion> {
     match *addr {
-        Address::DomainNameAddress(ref dname, _) => dname == UOT_MAGIC_ADDRESS,
-        Address::SocketAddress(..) => false,
+        Address::DomainNameAddress(ref dname, _) => match dname.as_str() {
+            UOT_V1_MAGIC_ADDRESS => Some(UotVersion::V1),
+            UOT_V2_MAGIC_ADDRESS => Some(UotVersion::V2),
+            _ => None,
+        },
+        Address::SocketAddress(..) => None,
     }
+}
+
+/// How the destination of each datagram is carried
+enum Mode {
+    /// v1 and v2 non-connect: every frame carries its own destination
+    PerPacket,
+    /// v2 connect: fixed destination from the request header, frames carry payloads only
+    Connected(Address),
 }
 
 /// Relay UDP datagrams tunneled in an (already decrypted) shadowsocks TCP stream.
 ///
 /// Unlike [`super::udprelay`] there is no NAT association map: the stream itself is the
 /// association, and it ends when either direction fails or the client closes.
-pub async fn serve<S>(context: Arc<ServiceContext>, peer_addr: SocketAddr, stream: S) -> io::Result<()>
+pub async fn serve<S>(
+    context: Arc<ServiceContext>,
+    peer_addr: SocketAddr,
+    stream: S,
+    version: UotVersion,
+) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::with_capacity(UOT_STREAM_BUFFER_SIZE, reader);
 
-    trace!("established uot tunnel {} <-> ...", peer_addr);
+    let mode = match version {
+        UotVersion::V1 => Mode::PerPacket,
+        UotVersion::V2 => read_v2_request(&mut reader).await?,
+    };
+
+    match mode {
+        Mode::PerPacket => trace!("established uot tunnel {} <-> ... with {:?}", peer_addr, version),
+        Mode::Connected(ref target_addr) => trace!(
+            "established uot tunnel {} <-> {} with {:?} connect",
+            peer_addr, target_addr, version
+        ),
+    }
 
     let (sender, mut receiver) = mpsc::channel(UOT_SEND_CHANNEL_SIZE);
 
     // The outbound sockets are created lazily, and both directions need them, so they are owned by
     // the downlink alone and the uplink hands over datagrams through the channel.
     tokio::select! {
-        result = relay_uplink(&mut reader, &sender, peer_addr) => result,
-        result = relay_downlink(&context, peer_addr, &mut writer, &mut receiver) => result,
+        result = relay_uplink(&mut reader, &mode, &sender, peer_addr) => result,
+        result = relay_downlink(&context, peer_addr, &mut writer, &mut receiver, &mode) => result,
     }
+}
+
+/// Read the v2 request header `| isConnect u8 | SOCKS5 address |`
+async fn read_v2_request<R>(reader: &mut R) -> io::Result<Mode>
+where
+    R: AsyncRead + Unpin,
+{
+    let is_connect = reader.read_u8().await?;
+    // Unlike the frames, the request header carries a SOCKS5 address.
+    let target_addr = Address::read_from(reader).await?;
+
+    Ok(if is_connect == 0 {
+        // Non-connect: multi destination, the header's address is unused.
+        Mode::PerPacket
+    } else {
+        Mode::Connected(target_addr)
+    })
 }
 
 /// client -> remote. Parses frames and forwards them to the downlink, which owns the sockets.
 async fn relay_uplink<R>(
     reader: &mut R,
+    mode: &Mode,
     sender: &mpsc::Sender<(Address, Vec<u8>)>,
     peer_addr: SocketAddr,
 ) -> io::Result<()>
@@ -95,7 +154,7 @@ where
     R: AsyncRead + Unpin,
 {
     loop {
-        match read_frame(reader).await? {
+        match read_frame(reader, mode).await? {
             Some(packet) => {
                 if sender.send(packet).await.is_err() {
                     // Downlink exited, it will report the error.
@@ -116,6 +175,7 @@ async fn relay_downlink<W>(
     peer_addr: SocketAddr,
     writer: &mut W,
     receiver: &mut mpsc::Receiver<(Address, Vec<u8>)>,
+    mode: &Mode,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -164,7 +224,7 @@ where
             received_opt = receive_from_outbound_opt(&outbound_ipv4_socket, &mut outbound_ipv4_buffer), if outbound_ipv4_socket.is_some() => {
                 match received_opt {
                     Ok((n, addr)) => {
-                        write_respond_packet(writer, &mut frame, peer_addr, addr, &outbound_ipv4_buffer[..n]).await?;
+                        write_respond_packet(writer, &mut frame, mode, peer_addr, addr, &outbound_ipv4_buffer[..n]).await?;
                     }
                     Err(err) => {
                         error!("uot relay {} <- ... failed, error: {}", peer_addr, err);
@@ -177,7 +237,7 @@ where
             received_opt = receive_from_outbound_opt(&outbound_ipv6_socket, &mut outbound_ipv6_buffer), if outbound_ipv6_socket.is_some() => {
                 match received_opt {
                     Ok((n, addr)) => {
-                        write_respond_packet(writer, &mut frame, peer_addr, addr, &outbound_ipv6_buffer[..n]).await?;
+                        write_respond_packet(writer, &mut frame, mode, peer_addr, addr, &outbound_ipv6_buffer[..n]).await?;
                     }
                     Err(err) => {
                         error!("uot relay {} <- ... failed, error: {}", peer_addr, err);
@@ -210,19 +270,27 @@ async fn receive_from_outbound_opt(
 ///
 /// Returns `None` if the client closed the stream at a frame boundary. A partial frame is an
 /// error: one `read` is not one datagram, so frames are delimited by the length prefix only.
-async fn read_frame<R>(reader: &mut R) -> io::Result<Option<(Address, Vec<u8>)>>
+async fn read_frame<R>(reader: &mut R, mode: &Mode) -> io::Result<Option<(Address, Vec<u8>)>>
 where
     R: AsyncRead + Unpin,
 {
     // The first byte doubles as the EOF probe.
-    let atyp = match reader.read_u8().await {
+    let first_byte = match reader.read_u8().await {
         Ok(b) => b,
         Err(ref err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
         Err(err) => return Err(err),
     };
 
-    let target_addr = read_frame_address(reader, atyp).await?;
-    let payload_len = reader.read_u16().await?;
+    let (target_addr, payload_len) = match *mode {
+        Mode::PerPacket => {
+            let target_addr = read_frame_address(reader, first_byte).await?;
+            (target_addr, reader.read_u16().await?)
+        }
+        Mode::Connected(ref target_addr) => (
+            target_addr.clone(),
+            u16::from_be_bytes([first_byte, reader.read_u8().await?]),
+        ),
+    };
 
     // payload_len is a u16, so this allocation is bounded by 65535 bytes.
     let mut payload = vec![0u8; payload_len as usize];
@@ -287,6 +355,7 @@ fn write_frame_address(buf: &mut Vec<u8>, addr: &SocketAddr) {
 async fn write_respond_packet<W>(
     writer: &mut W,
     frame: &mut Vec<u8>,
+    mode: &Mode,
     peer_addr: SocketAddr,
     mut source_addr: SocketAddr,
     data: &[u8],
@@ -320,7 +389,9 @@ where
     }
 
     frame.clear();
-    write_frame_address(frame, &source_addr);
+    if let Mode::PerPacket = *mode {
+        write_frame_address(frame, &source_addr);
+    }
     frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
     frame.extend_from_slice(data);
 
@@ -432,6 +503,64 @@ mod tests {
         frame
     }
 
+    async fn read_one(data: &[u8], mode: &Mode) -> io::Result<Option<(Address, Vec<u8>)>> {
+        let mut reader = data;
+        read_frame(&mut reader, mode).await
+    }
+
+    #[test]
+    fn detect_magic_matches_both_versions() {
+        assert_eq!(
+            detect_magic(&Address::DomainNameAddress("sp.udp-over-tcp.arpa".to_owned(), 0)),
+            Some(UotVersion::V1)
+        );
+        assert_eq!(
+            detect_magic(&Address::DomainNameAddress("sp.v2.udp-over-tcp.arpa".to_owned(), 0)),
+            Some(UotVersion::V2)
+        );
+        // The port is not part of the signal
+        assert_eq!(
+            detect_magic(&Address::DomainNameAddress("sp.udp-over-tcp.arpa".to_owned(), 53)),
+            Some(UotVersion::V1)
+        );
+        assert_eq!(
+            detect_magic(&Address::DomainNameAddress("www.example.com".to_owned(), 0)),
+            None
+        );
+        assert_eq!(detect_magic(&Address::SocketAddress(peer_addr())), None);
+    }
+
+    #[tokio::test]
+    async fn read_frame_address_parses_all_atyps() {
+        let ipv4 = [UOT_ATYP_IPV4, 192, 168, 1, 1, 0x1F, 0x90];
+        let (addr, payload) = read_one(&encode_frame_bytes(&ipv4, b"v4"), &Mode::PerPacket)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr, Address::SocketAddress("192.168.1.1:8080".parse().unwrap()));
+        assert_eq!(payload, b"v4");
+
+        let mut ipv6 = vec![UOT_ATYP_IPV6];
+        ipv6.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        ipv6.extend_from_slice(&443u16.to_be_bytes());
+        let (addr, payload) = read_one(&encode_frame_bytes(&ipv6, b"v6"), &Mode::PerPacket)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr, Address::SocketAddress("[::1]:443".parse().unwrap()));
+        assert_eq!(payload, b"v6");
+
+        let mut domain = vec![UOT_ATYP_DOMAIN, 11];
+        domain.extend_from_slice(b"example.com");
+        domain.extend_from_slice(&53u16.to_be_bytes());
+        let (addr, payload) = read_one(&encode_frame_bytes(&domain, b"dns"), &Mode::PerPacket)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(addr, Address::DomainNameAddress("example.com".to_owned(), 53));
+        assert_eq!(payload, b"dns");
+    }
+
     fn encode_frame_bytes(addr: &[u8], payload: &[u8]) -> Vec<u8> {
         let mut frame = addr.to_vec();
         frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
@@ -439,56 +568,13 @@ mod tests {
         frame
     }
 
-    async fn read_one(data: &[u8]) -> io::Result<Option<(Address, Vec<u8>)>> {
-        let mut reader = data;
-        read_frame(&mut reader).await
-    }
-
-    #[test]
-    fn is_magic_address_matches_the_magic_domain() {
-        assert!(is_magic_address(&Address::DomainNameAddress(
-            "sp.udp-over-tcp.arpa".to_owned(),
-            0
-        )));
-        // The port is not part of the signal
-        assert!(is_magic_address(&Address::DomainNameAddress(
-            "sp.udp-over-tcp.arpa".to_owned(),
-            53
-        )));
-        assert!(!is_magic_address(&Address::DomainNameAddress(
-            "www.example.com".to_owned(),
-            0
-        )));
-        assert!(!is_magic_address(&Address::SocketAddress(peer_addr())));
-    }
-
-    #[tokio::test]
-    async fn read_frame_address_parses_all_atyps() {
-        let ipv4 = [UOT_ATYP_IPV4, 192, 168, 1, 1, 0x1F, 0x90];
-        let (addr, payload) = read_one(&encode_frame_bytes(&ipv4, b"v4")).await.unwrap().unwrap();
-        assert_eq!(addr, Address::SocketAddress("192.168.1.1:8080".parse().unwrap()));
-        assert_eq!(payload, b"v4");
-
-        let mut ipv6 = vec![UOT_ATYP_IPV6];
-        ipv6.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
-        ipv6.extend_from_slice(&443u16.to_be_bytes());
-        let (addr, payload) = read_one(&encode_frame_bytes(&ipv6, b"v6")).await.unwrap().unwrap();
-        assert_eq!(addr, Address::SocketAddress("[::1]:443".parse().unwrap()));
-        assert_eq!(payload, b"v6");
-
-        let mut domain = vec![UOT_ATYP_DOMAIN, 11];
-        domain.extend_from_slice(b"example.com");
-        domain.extend_from_slice(&53u16.to_be_bytes());
-        let (addr, payload) = read_one(&encode_frame_bytes(&domain, b"dns")).await.unwrap().unwrap();
-        assert_eq!(addr, Address::DomainNameAddress("example.com".to_owned(), 53));
-        assert_eq!(payload, b"dns");
-    }
-
     /// The frame ATYPs are not the SOCKS5 ones: `0x01` is IPv6 here, IPv4 in SOCKS5.
     #[tokio::test]
     async fn read_frame_address_rejects_socks5_atyps() {
         for atyp in [0x03u8, 0x04u8] {
-            let err = read_one(&[atyp, 1, 2, 3, 4, 5, 6, 7, 8]).await.unwrap_err();
+            let err = read_one(&[atyp, 1, 2, 3, 4, 5, 6, 7, 8], &Mode::PerPacket)
+                .await
+                .unwrap_err();
             assert!(err.to_string().contains("unknown uot ATYP"), "{err}");
         }
 
@@ -497,7 +583,10 @@ mod tests {
         socks5_ipv4.extend_from_slice(&[0u8; 12]);
         socks5_ipv4.extend_from_slice(&53u16.to_be_bytes());
 
-        let (addr, _) = read_one(&encode_frame_bytes(&socks5_ipv4, b"")).await.unwrap().unwrap();
+        let (addr, _) = read_one(&encode_frame_bytes(&socks5_ipv4, b""), &Mode::PerPacket)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(addr, Address::SocketAddress("[102:304::]:53".parse().unwrap()));
     }
 
@@ -532,11 +621,14 @@ mod tests {
             (Address::SocketAddress(second), b"two".to_vec()),
             (Address::SocketAddress(first), Vec::new()),
         ] {
-            assert_eq!(read_frame(&mut reader).await.unwrap().unwrap(), expected);
+            assert_eq!(
+                read_frame(&mut reader, &Mode::PerPacket).await.unwrap().unwrap(),
+                expected
+            );
         }
 
         // Closed at a frame boundary
-        assert!(read_frame(&mut reader).await.unwrap().is_none());
+        assert!(read_frame(&mut reader, &Mode::PerPacket).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -544,7 +636,10 @@ mod tests {
         let addr = "192.168.1.1:8080".parse().unwrap();
         let payload = vec![0xABu8; u16::MAX as usize];
 
-        let (_, read_payload) = read_one(&encode_frame(&addr, &payload)).await.unwrap().unwrap();
+        let (_, read_payload) = read_one(&encode_frame(&addr, &payload), &Mode::PerPacket)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(read_payload, payload);
     }
 
@@ -554,7 +649,7 @@ mod tests {
         let frame = encode_frame(&addr, b"truncated");
 
         for cut in 1..frame.len() {
-            let err = read_one(&frame[..cut]).await.unwrap_err();
+            let err = read_one(&frame[..cut], &Mode::PerPacket).await.unwrap_err();
             assert_eq!(err.kind(), ErrorKind::UnexpectedEof, "cut at {cut}");
         }
     }
@@ -576,9 +671,50 @@ mod tests {
             }
         });
 
-        let (read_addr, payload) = read_frame(&mut server).await.unwrap().unwrap();
+        let (read_addr, payload) = read_frame(&mut server, &Mode::PerPacket).await.unwrap().unwrap();
         assert_eq!(read_addr, Address::SocketAddress(addr));
         assert_eq!(payload, b"fragmented payload");
+    }
+
+    #[tokio::test]
+    async fn read_frame_connected_mode_has_no_address() {
+        let target_addr = Address::DomainNameAddress("example.com".to_owned(), 53);
+        let mode = Mode::Connected(target_addr.clone());
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&3u16.to_be_bytes());
+        stream.extend_from_slice(b"one");
+        stream.extend_from_slice(&0u16.to_be_bytes());
+
+        let mut reader: &[u8] = &stream;
+        assert_eq!(
+            read_frame(&mut reader, &mode).await.unwrap().unwrap(),
+            (target_addr.clone(), b"one".to_vec())
+        );
+        assert_eq!(
+            read_frame(&mut reader, &mode).await.unwrap().unwrap(),
+            (target_addr, Vec::new())
+        );
+        assert!(read_frame(&mut reader, &mode).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_v2_request_selects_mode() {
+        let target_addr = Address::DomainNameAddress("example.com".to_owned(), 53);
+
+        for (is_connect, connected) in [(1u8, true), (0u8, false)] {
+            let mut request = vec![is_connect];
+            target_addr.write_to_buf(&mut request);
+
+            let mut reader: &[u8] = &request;
+            match read_v2_request(&mut reader).await.unwrap() {
+                Mode::Connected(addr) => {
+                    assert!(connected);
+                    assert_eq!(addr, target_addr);
+                }
+                Mode::PerPacket => assert!(!connected),
+            }
+        }
     }
 
     /// Echoes datagrams back to their sender until dropped
@@ -598,15 +734,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_relays_datagrams() {
+    async fn serve_v1_relays_datagrams() {
         let echo_addr = spawn_udp_echo().await;
 
         let (mut client, server) = tokio::io::duplex(MAXIMUM_UDP_PAYLOAD_SIZE);
-        tokio::spawn(serve(Arc::new(ServiceContext::new()), peer_addr(), server));
+        tokio::spawn(serve(
+            Arc::new(ServiceContext::new()),
+            peer_addr(),
+            server,
+            UotVersion::V1,
+        ));
 
         client.write_all(&encode_frame(&echo_addr, b"ping")).await.unwrap();
 
-        let (source_addr, payload) = time::timeout(Duration::from_secs(5), read_frame(&mut client))
+        let (source_addr, payload) = time::timeout(Duration::from_secs(5), read_frame(&mut client, &Mode::PerPacket))
+            .await
+            .expect("timed out waiting for the echoed datagram")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(source_addr, Address::SocketAddress(echo_addr));
+        assert_eq!(payload, b"ping");
+    }
+
+    #[tokio::test]
+    async fn serve_v2_connect_relays_datagrams() {
+        let echo_addr = spawn_udp_echo().await;
+
+        let (mut client, server) = tokio::io::duplex(MAXIMUM_UDP_PAYLOAD_SIZE);
+        tokio::spawn(serve(
+            Arc::new(ServiceContext::new()),
+            peer_addr(),
+            server,
+            UotVersion::V2,
+        ));
+
+        // Request header, then address-less frames
+        let mut request = vec![1u8];
+        Address::SocketAddress(echo_addr).write_to_buf(&mut request);
+        request.extend_from_slice(&4u16.to_be_bytes());
+        request.extend_from_slice(b"ping");
+        client.write_all(&request).await.unwrap();
+
+        let mode = Mode::Connected(Address::SocketAddress(echo_addr));
+        let (_, payload) = time::timeout(Duration::from_secs(5), read_frame(&mut client, &mode))
+            .await
+            .expect("timed out waiting for the echoed datagram")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(payload, b"ping");
+    }
+
+    #[tokio::test]
+    async fn serve_v2_non_connect_relays_datagrams() {
+        let echo_addr = spawn_udp_echo().await;
+
+        let (mut client, server) = tokio::io::duplex(MAXIMUM_UDP_PAYLOAD_SIZE);
+        tokio::spawn(serve(
+            Arc::new(ServiceContext::new()),
+            peer_addr(),
+            server,
+            UotVersion::V2,
+        ));
+
+        // isConnect = 0, so the header's address is ignored and frames carry their own.
+        let mut request = vec![0u8];
+        Address::DomainNameAddress("example.com".to_owned(), 53).write_to_buf(&mut request);
+        request.extend_from_slice(&encode_frame(&echo_addr, b"ping"));
+        client.write_all(&request).await.unwrap();
+
+        let (source_addr, payload) = time::timeout(Duration::from_secs(5), read_frame(&mut client, &Mode::PerPacket))
             .await
             .expect("timed out waiting for the echoed datagram")
             .unwrap()
